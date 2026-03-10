@@ -3,79 +3,13 @@ library(lubridate)
 library(sf)
 library(tigris)
 library(leaflet)
+library(tidycensus)
 
-# =============================================================================
-# DATA CLEANING OVERVIEW
-# =============================================================================
-# This script prepares the analytical dataset for studying whether food safety
-# outcomes in Boston vary with neighbourhood socioeconomic and demographic
-# characteristics, after controlling for business type, license age, and
-# inspection frequency.
-#
-# The cleaning pipeline proceeds in the following steps:
-#
-# 1. LOADING & DATE PARSING (raw_data)
-#    - Read the Boston Food Inspection CSV.
-#    - Parse resultdttm (inspection datetime) using ymd_hms() and extract year.
-#    - Filter to inspections from 2015 onwards to focus on recent trends and
-#      ensure sufficient sample size, dropping records with missing dates.
-#
-# 2. OUTCOME VARIABLE (pass_fail)
-#    - Recode viol_status into a binary numeric variable: Pass = 1, Fail = 0.
-#    - Records with any other value (e.g. NA, "HE_Fail") are set to NA and
-#      excluded downstream via filter(!is.na(pass_fail)).
-#
-# 3. GEOLOCATION PARSING (lat, lon)
-#    - Extract latitude and longitude from the location column, which stores
-#      coordinates as "(lat, lon)" strings.
-#    - Records with missing coordinates are excluded downstream.
-#
-# 4. CENSUS DATA (acs_data -> acs_clean)
-#    - Pull 2019 ACS 5-year estimates at the ZCTA (ZIP code tabulation area)
-#      level via tidycensus. The 5-year survey is used because 1-year estimates
-#      are not published for small geographies like ZCTAs.
-#    - Variables pulled: median household income, total population, poverty
-#      status counts, full racial breakdown (White, Black, Indigenous, Asian,
-#      Hawaiian, Other), Hispanic/Latino ethnicity, and foreign-born status.
-#    - Data arrives in long format (one row per ZCTA per variable); pivoted
-#      wide and derived rates computed (poverty_rate, pct_* for each group,
-#      pct_foreign_born).
-#
-# 5. RECORD-LEVEL ANALYTICAL DATASET (analysis_data)
-#    - Filter raw_data to valid pass_fail, lat, and lon values.
-#    - Left-join ACS neighbourhood characteristics to each inspection record
-#      via ZIP code (padded to 5 digits to match ZCTA GEOIDs).
-#    - Deduplicate to one row per inspection visit using distinct(licenseno,
-#      insp_date): the raw data has one row per violation within a visit, but
-#      viol_status (and hence pass_fail) reflects the overall visit outcome,
-#      so keeping multiple rows per visit would inflate inspection counts.
-#
-# 6. CONTROL VARIABLES
-#    - insp_per_year: number of inspection visits per establishment per year,
-#      computed after deduplication so it counts visits, not violations.
-#      Used as a control for inspection targeting bias.
-#    - license_age: years elapsed between license issuance and inspection date,
-#      floored at 0 to handle any data entry errors. Proxy for establishment
-#      experience/maturity.
-#    - business_type: licensecat collapsed into 6 broad categories
-#      (Restaurant/Food Service, Retail Food, Mobile Food, Caterer,
-#      Institutional, Other) via regex matching. Stored as a factor.
-#
-# 7. DATA QUALITY FLAGS & TYPE CONVERSIONS
-#    - acs_missing: TRUE if the inspection ZIP did not match any ZCTA in the
-#      ACS data, indicating the neighbourhood-level covariates are unavailable
-#      for that record.
-#    - zip converted to character; year converted to integer (suitable for use
-#      as a trend term or factor in regression models).
-#
-# OUTPUT DATASETS:
-#    - analysis_data : inspection-level dataset ready for regression modelling
-#                      and trend analysis (one row per inspection visit)
-#    - neighbourhood_summary : ZIP-level aggregation of fail rates, used for
-#                              the EDA choropleth map below
-# =============================================================================
+options(tigris_use_cache = TRUE)
 
+#--------------
 # Loading data
+#-------------
 raw_data = read_csv('/Users/juliettebacuvier/desktop/tmpp7jeda9f.csv')
 
 names(raw_data)
@@ -83,85 +17,150 @@ names(raw_data)
 
 # parsing dates & filtering to last 5 years
 raw_data = raw_data %>%
-  mutate(
-    insp_date = ymd_hms(resultdttm),
-    year = year(insp_date)
-  ) %>%
-  filter(year >= 2015, !is.na(insp_date))
+   mutate(
+      insp_date = ymd_hms(resultdttm),
+      year = year(insp_date)
+   ) %>%
+   filter(year >= 2015, !is.na(insp_date))
 
-# creating binary pass/fail variable from viol_status
+# -------------------------------------------------------------
+# Outcome variable —-> investigate both viol_status & result
+# -------------------------------------------------------------
+
+cat("=== viol_status distribution ===\n")
+raw_data %>% count(viol_status, sort = TRUE) %>% print(n = 20)
+
+cat("\n=== result distribution ===\n")
+raw_data %>% count(result, sort = TRUE) %>% print(n = 20)
+
+# checking if viol_status varies within a single inspection visit
+# (if it does, it's per-violation, not per-inspection)
+conflicting = raw_data %>%
+  group_by(licenseno, insp_date) %>%
+  summarise(n_statuses = n_distinct(viol_status), .groups = "drop") %>%
+  filter(n_statuses > 1)
+cat("\nVisits with conflicting viol_status:", nrow(conflicting), "\n")
+
 raw_data = raw_data %>%
   mutate(
     pass_fail = case_when(
-      viol_status == "Pass" ~ 1L,
-      viol_status == "Fail" ~ 0L,
-      TRUE ~ NA_integer_)
+      str_detect(result, regex("pass", ignore_case = TRUE)) ~ 1L,
+      str_detect(result, regex("fail", ignore_case = TRUE)) ~ 0L,
+      TRUE ~ NA_integer_
+    )
   )
 
-# parsing location into lat/lon
+# ----------------------------
+# Geography parsing
+# ----------------------------
+
 raw_data = raw_data %>%
   mutate(
     location = str_remove_all(location, "[()]"),
     lat = as.numeric(str_trim(str_split_fixed(location, ",", 2)[, 1])),
-    lon = as.numeric(str_trim(str_split_fixed(location, ",", 2)[, 2])))
+    lon = as.numeric(str_trim(str_split_fixed(location, ",", 2)[, 2]))
+  )
 
-# extracting acs data
-library(tidycensus)
+# ---------------------------
+# Census tract ACS data
+# ---------------------------
 
 acs_data = get_acs(
-  geography = "zcta",
-  variables = c(
-    median_income = "B19013_001",
-    total_pop = "B01003_001",
-    below_poverty = "B17001_002",
-    total_poverty = "B17001_001",
-    white_alone = "B02001_002",
-    black_alone = "B02001_003",
-    indigenous_alone = "B02001_004",
-    asian_alone = "B02001_005",
-    hawaiian_alone = "B02001_006",
-    other_race_alone = "B02001_007",
-    total_race = "B02001_001",
-    hispanic = "B03002_012",
-    total_hispanic = "B03002_001",
-    foreign_born = "B05002_013",
-    total_nativity = "B05002_001"
-  ),
-  year = 2019,
-  survey = "acs5"
+   geography = "tract",
+   state = "MA",
+   variables = c(
+      median_income = "B19013_001",
+      total_pop = "B01003_001",
+      below_poverty = "B17001_002",
+      total_poverty = "B17001_001",
+      white_alone = "B02001_002",
+      black_alone = "B02001_003",
+      indigenous_alone = "B02001_004",
+      asian_alone = "B02001_005",
+      hawaiian_alone = "B02001_006",
+      other_race_alone = "B02001_007",
+      total_race = "B02001_001",
+      hispanic = "B03002_012",
+      total_hispanic = "B03002_001",
+      foreign_born = "B05002_013",
+      total_nativity = "B05002_001"
+   ),
+   year = 2019,
+   survey = "acs5"
 )
 
 glimpse(acs_data)
 
 # cleaning acs data: pivot wide and compute derived variables
 acs_clean = acs_data %>%
-  select(GEOID, variable, estimate) %>%
-  pivot_wider(names_from = variable, values_from = estimate) %>%
-  mutate(
-    poverty_rate = ifelse(total_poverty == 0, NA_real_, below_poverty / total_poverty),
-    pct_white = ifelse(total_race == 0, NA_real_, white_alone / total_race),
-    pct_black = ifelse(total_race == 0, NA_real_, black_alone / total_race),
-    pct_indigenous = ifelse(total_race == 0, NA_real_, indigenous_alone / total_race),
-    pct_asian = ifelse(total_race == 0, NA_real_, asian_alone / total_race),
-    pct_hawaiian = ifelse(total_race == 0, NA_real_, hawaiian_alone / total_race),
-    pct_other_race = ifelse(total_race == 0, NA_real_, other_race_alone / total_race),
-    pct_hispanic = ifelse(total_hispanic == 0, NA_real_, hispanic / total_hispanic),
-    pct_foreign_born = ifelse(total_nativity == 0, NA_real_, foreign_born / total_nativity)
-  )
+   select(GEOID, variable, estimate) %>%
+   pivot_wider(names_from = variable, values_from = estimate) %>%
+   mutate(
+      poverty_rate = ifelse(total_poverty == 0, NA_real_, below_poverty / total_poverty),
+      pct_white = ifelse(total_race == 0, NA_real_, white_alone / total_race),
+      pct_black = ifelse(total_race == 0, NA_real_, black_alone / total_race),
+      pct_indigenous = ifelse(total_race == 0, NA_real_, indigenous_alone / total_race),
+      pct_asian = ifelse(total_race == 0, NA_real_, asian_alone / total_race),
+      pct_hawaiian = ifelse(total_race == 0, NA_real_, hawaiian_alone / total_race),
+      pct_other_race = ifelse(total_race == 0, NA_real_, other_race_alone / total_race),
+      pct_hispanic = ifelse(total_hispanic == 0, NA_real_, hispanic / total_hispanic),
+      pct_foreign_born = ifelse(total_nativity == 0, NA_real_, foreign_born / total_nativity)
+   )
 
-# building record-level analytical dataset: join ACS to each inspection record
+cat("\nACS tract data:", nrow(acs_clean), "tracts\n")
+
+# -------------------------------------------------------------
+# Spatial join --> assigning each inspection to a census tract
+# -------------------------------------------------------------
+
+# loading MA census tract geometries
+ma_tracts = tracts(state = "MA", year = 2019, cb = TRUE) %>%
+  st_transform(crs = 4326)
+
+# filtering to valid inspection records
 analysis_data = raw_data %>%
-  filter(!is.na(pass_fail), !is.na(lat), !is.na(lon)) %>%
-  mutate(zip_pad = str_pad(as.character(zip), width = 5, pad = "0")) %>%
-  left_join(acs_clean, by = c("zip_pad" = "GEOID")) %>%
-  select(-zip_pad)
+  filter(!is.na(pass_fail), !is.na(lat), !is.na(lon))
 
-# deduplicating to one row per inspection visit
-# (raw data has one row per violation, & viol_status reflects the overall inspection outcome)
+# converting inspections to sf points
+inspections_sf = analysis_data %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+# spatial join: find which tract each inspection point falls in
+inspections_sf = st_join(inspections_sf, ma_tracts %>% select(GEOID), join = st_within)
+
+# pulling the tract GEOID back into the regular data frame
+analysis_data$tract_geoid = inspections_sf$GEOID
+
+# reporting match rate
+cat("\nTract spatial join match rate:",
+    round(mean(!is.na(analysis_data$tract_geoid)) * 100, 1), "%\n")
+
+# -------------------------------------------------------------
+# Joining ACS to inspections via tract GEOID
+# -------------------------------------------------------------
+
 analysis_data = analysis_data %>%
-  distinct(licenseno, insp_date, .keep_all = TRUE)
+  left_join(acs_clean, by = c("tract_geoid" = "GEOID"))
 
-# computing inspection frequency per establishment per year (control variable)
+# -------------------------------------------------------------
+# Deduplication --> one row per inspection visit
+# -------------------------------------------------------------
+
+# The raw data has one row per violation within a visit, but pass_fail
+# reflects the overall visit outcome. Keeping duplicates inflates counts.
+# Take the WORST outcome per visit (Fail = 0 beats Pass = 1).
+analysis_data = analysis_data %>%
+  group_by(licenseno, insp_date) %>%
+  arrange(pass_fail) %>% # puts 0 (Fail) before 1 (Pass)
+  slice(1) %>% # keeps the worst outcome
+
+ungroup()
+
+# -------------------------------------------------------------
+# "Control variables"
+# -------------------------------------------------------------
+
+# inspection frequency per establishment per year
 insp_freq = analysis_data %>%
   group_by(licenseno, year) %>%
   summarise(insp_per_year = n(), .groups = "drop")
@@ -169,7 +168,7 @@ insp_freq = analysis_data %>%
 analysis_data = analysis_data %>%
   left_join(insp_freq, by = c("licenseno", "year"))
 
-# computing license age in years since issuance
+# license age in years since issuance
 analysis_data = analysis_data %>%
   mutate(
     iss_date = ymd_hms(issdttm),
@@ -177,7 +176,7 @@ analysis_data = analysis_data %>%
     license_age = pmax(license_age, 0, na.rm = TRUE)
   )
 
-# collapsing licensecat into broad business type categories
+# broad business type categories
 analysis_data = analysis_data %>%
   mutate(
     business_type = case_when(
@@ -191,21 +190,72 @@ analysis_data = analysis_data %>%
     business_type = factor(business_type)
   )
 
-# flagging records with missing ACS data (zip did not match any ZCTA)
-analysis_data = analysis_data %>%
-  mutate(acs_missing = is.na(median_income))
+# -------------------------------------------------------------
+# Data quality flags & type conversions
+# -------------------------------------------------------------
 
-# converting types for modelling
 analysis_data = analysis_data %>%
   mutate(
+    acs_missing = is.na(median_income),
     zip = as.character(zip),
-    year = as.integer(year))
+    year = as.integer(year)
+  )
+
+# -------------------------------------------------------------
+# Summary diagnositcs
+# -------------------------------------------------------------
+
+cat("\n=== Final dataset ===\n")
+cat("Rows:", nrow(analysis_data), "\n")
+cat("Unique tracts:", n_distinct(analysis_data$tract_geoid, na.rm = TRUE), "\n")
+cat("Unique ZIPs:", n_distinct(analysis_data$zip, na.rm = TRUE), "\n")
+cat("ACS match rate:", round(mean(!analysis_data$acs_missing) * 100, 1), "%\n")
+cat("Year range:", min(analysis_data$year), "-", max(analysis_data$year), "\n\n")
+
+# Missingness summary
+cat("=== Missingness ===\n")
+analysis_data %>%
+  summarise(across(
+    c(pass_fail, lat, lon, tract_geoid, median_income, poverty_rate,
+      pct_white, pct_black, pct_hispanic, pct_foreign_born,
+      license_age, insp_per_year, business_type),
+    ~ sum(is.na(.))
+  )) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = round(n_missing / nrow(analysis_data) * 100, 1)) %>%
+  arrange(desc(n_missing)) %>%
+  print(n = 20)
+
+# Fail rate range across tracts
+cat("\n=== Fail rate range across tracts (min 10 inspections) ===\n")
+tract_fail = analysis_data %>%
+  filter(!is.na(tract_geoid)) %>%
+  group_by(tract_geoid) %>%
+  summarise(
+    n = n(),
+    fail_rate = mean(1 - pass_fail, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 10)
+
+cat("Tracts:", nrow(tract_fail), "\n")
+cat("Fail rate range:", round(min(tract_fail$fail_rate) * 100, 1), "% to",
+    round(max(tract_fail$fail_rate) * 100, 1), "%\n")
+cat("Fail rate SD:", round(sd(tract_fail$fail_rate) * 100, 1), "pp\n")
 
 glimpse(analysis_data)
 
-# neighbourhood-level summary (derived from analysis_data, used for EDA map)
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2", repos = "https://cloud.r-project.org")
+if (!requireNamespace("ggcorrplot", quietly = TRUE)) install.packages("ggcorrplot", repos = "https://cloud.r-project.org")
+library(ggplot2)
+library(ggcorrplot)
+
+#---------------------------------------------------------------------------
+# Chloropleth Map
+#---------------------------------------------------------------------------
 neighbourhood_summary = analysis_data %>%
-  group_by(zip) %>%
+  filter(!is.na(tract_geoid)) %>%
+  group_by(tract_geoid) %>%
   summarise(
     n_inspections = n(),
     fail_rate = mean(1 - pass_fail, na.rm = TRUE),
@@ -215,54 +265,31 @@ neighbourhood_summary = analysis_data %>%
 
 print(neighbourhood_summary)
 
-# visualising fail rate by neighbourhood
 plot_data = neighbourhood_summary %>%
-  filter(n_inspections >= 10) %>%
-  arrange(desc(fail_rate))
+  filter(n_inspections >= 10)
 
-# ZIP to neighbourhood crosswalk for Boston and surrounding areas
-boston_neighbourhoods = tibble(
-  zip = c("02101", "02108", "02109", "02110", "02111", "02113", "02114", "02115",
-          "02116", "02118", "02119", "02120", "02121", "02122", "02124", "02125",
-          "02126", "02127", "02128", "02129", "02130", "02131", "02132", "02134",
-          "02135", "02136", "02163", "02199", "02210", "02215", "02445", "02446", 
-          "02467", "02138", "02139", "02140", "02141", "02142", "02143", "02144", 
-          "02145", "02472"),
-  neighbourhood = c("Downtown", "Beacon Hill", "North End/Waterfront", "Financial 
-   District", "Chinatown", "North End", "Beacon Hill/West End", "Fenway/Longwood",
-                    "Back Bay", "South End", "Roxbury", "Mission Hill", "Dorchester (Grove Hall)",
-                    "Dorchester (Neponset)", "Dorchester (Codman Square)", "Dorchester (Savin Hill)",
-                    "Mattapan", "South Boston", "East Boston", "Charlestown", "Jamaica Plain", "Roslindale",
-                    "West Roxbury", "Allston", "Brighton", "Hyde Park", "Allston (HBS)", 
-                    "Back Bay (Prudential)", "Seaport/Fort Point", "Fenway/Kenmore", "Brookline", 
-                    "Brookline (Longwood/Coolidge Corner)", "Chestnut Hill", "Cambridge (Harvard Square)",
-                    "Cambridge (Central/MIT)", "Cambridge (North)", "Cambridge (East)", "Cambridge (Kendall Square)", "Somerville (Davis Square)", "Somerville", "Somerville (East)", "Watertown"
-  )
+# Filter tract geometries to those in our data
+map_tracts = ma_tracts %>%
+  filter(GEOID %in% plot_data$tract_geoid) %>%
+  left_join(plot_data, by = c("GEOID" = "tract_geoid"))
+
+pal = colorNumeric(
+  palette = c("#f3d357", "#b90d0d"),
+  domain = map_tracts$fail_rate
 )
 
-options(tigris_use_cache = TRUE)
-boston_zctas = zctas(year = 2020, cb = TRUE) %>%
-  filter(ZCTA5CE20 %in% as.character(plot_data$zip))
-
-map_data = boston_zctas %>%
-  left_join(
-    plot_data %>% mutate(zip = as.character(zip)),
-    by = c("ZCTA5CE20" = "zip")
-  ) %>%
-  left_join(boston_neighbourhoods, by = c("ZCTA5CE20" = "zip")) %>%
-  mutate(neighbourhood = if_else(is.na(neighbourhood), ZCTA5CE20, neighbourhood)) %>%
-  st_transform(crs = 4326)
-
-pal = colorNumeric(palette = c("#f3d357", "#b90d0d"), domain = map_data$fail_rate)
-
-leaflet(map_data) %>%
+leaflet(map_tracts) %>%
   addProviderTiles(providers$CartoDB.Positron) %>%
   addPolygons(
     fillColor = ~pal(fail_rate),
     fillOpacity = 0.7,
     color = "white",
     weight = 1,
-    popup = ~paste0("<b>", neighbourhood, "</b><br>Fail rate: ", sprintf("%.1f%%", fail_rate * 100))
+    popup = ~paste0(
+      "<b>Tract ", GEOID, "</b><br>",
+      "Fail rate: ", sprintf("%.1f%%", fail_rate * 100), "<br>",
+      "Inspections: ", n_inspections
+    )
   ) %>%
   addLegend(
     pal = pal,
@@ -270,6 +297,4 @@ leaflet(map_data) %>%
     title = "Proportion Failed",
     labFormat = labelFormat(suffix = "%", transform = function(x) x * 100),
     position = "bottomright"
-    #decreasing = TRUE #commented it out because it's not working :(
   )
-
