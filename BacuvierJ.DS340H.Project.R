@@ -245,6 +245,11 @@ cat("Fail rate SD:", round(sd(tract_fail$fail_rate) * 100, 1), "pp\n")
 
 glimpse(analysis_data)
 
+
+
+#===============================================================================
+# EXPLORATORY DATA ANALYSIS
+# ==============================================================================
 if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2", repos = "https://cloud.r-project.org")
 if (!requireNamespace("ggcorrplot", quietly = TRUE)) install.packages("ggcorrplot", repos = "https://cloud.r-project.org")
 library(ggplot2)
@@ -298,3 +303,188 @@ leaflet(map_tracts) %>%
     labFormat = labelFormat(suffix = "%", transform = function(x) x * 100),
     position = "bottomright"
   )
+
+#---------------------------------------------------------------------------
+# Fail rate vs. Median income (ZIP-level scatterplot)
+#---------------------------------------------------------------------------
+
+tract_summary = analysis_data %>%
+  filter(!is.na(median_income), !is.na(pass_fail), !is.na(tract_geoid)) %>%
+  group_by(tract_geoid) %>%
+  summarise(
+    n_inspections = n(),
+    fail_rate = mean(1 - pass_fail, na.rm = TRUE),
+    median_income = first(median_income),
+    poverty_rate = first(poverty_rate),
+    pct_white = first(pct_white),
+    pct_black = first(pct_black),
+    pct_hispanic = first(pct_hispanic),
+    pct_foreign_born = first(pct_foreign_born),
+    .groups = "drop"
+  )
+
+ggplot(tract_summary, aes(x = median_income / 1000, y = fail_rate)) +
+  geom_point(aes(size = n_inspections), alpha = 0.5, color = "#b90d0d") +
+  geom_smooth(method = "lm", se = FALSE, color = "steelblue", linewidth = 0.8) +
+  scale_x_continuous(labels = scales::dollar_format(suffix = "K")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_size_continuous(range = c(1.5, 8), name = "Inspections") +
+  labs(
+    title = "Food Inspection Fail Rate vs. Median Household Income",
+    subtitle = "Each point is a census tract (min. 10 inspections); line shows linear trend",
+    x = "Median Household Income (ACS 2019, tract level)",
+    y = "Inspection Fail Rate",
+    caption = "Source: Boston Food Inspection data & ACS 5-year estimates (tract level)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+ggsave("plot1_failrate_vs_income_tract.png", width = 9, height = 6, dpi = 300)
+
+
+#---------------------------------------------------------------------------
+# Fail rate over time by income tercile --> to show whether disparities are growing, shrinking or stable
+#---------------------------------------------------------------------------
+
+tract_income = analysis_data %>%
+  filter(!is.na(median_income), !is.na(tract_geoid)) %>%
+  distinct(tract_geoid, median_income) %>%
+  mutate(
+    income_tercile = ntile(median_income, 3),
+    income_tercile = factor(income_tercile,
+                            labels = c("Low Income", "Middle Income", "High Income"))
+  )
+
+time_trends = analysis_data %>%
+  filter(!is.na(median_income), !is.na(pass_fail), !is.na(tract_geoid)) %>%
+  left_join(tract_income %>% select(tract_geoid, income_tercile), by = "tract_geoid") %>%
+  group_by(year, income_tercile) %>%
+  summarise(
+    fail_rate = mean(1 - pass_fail, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(time_trends, aes(x = year, y = fail_rate, color = income_tercile)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_continuous(breaks = scales::pretty_breaks()) +
+  scale_color_manual(
+    values = c("Low Income" = "#b90d0d", "Middle Income" = "#f0a500", "High Income" = "#2a7b9b"),
+    name = "Neighbourhood\nIncome Level"
+  ) +
+  labs(
+    title = "Inspection Fail Rate Over Time by Neighbourhood Income Level",
+    subtitle = "Census tracts grouped into income terciles (ACS median household income)",
+    x = "Year",
+    y = "Inspection Fail Rate",
+    caption = "Source: Boston Food Inspection data & ACS 5-year estimates (tract level)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+ggsave("plot2_failrate_time_trends_tract.png", width = 9, height = 6, dpi = 300)
+
+#---------------------------------------------------------------------------
+# Fail rate by business type
+#---------------------------------------------------------------------------
+
+business_summary = analysis_data %>%
+  filter(!is.na(pass_fail)) %>%
+  group_by(business_type) %>%
+  summarise(
+    n_inspections = n(),
+    fail_rate = mean(1 - pass_fail, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(fail_rate))
+
+table(analysis_data$licensecat)
+#will need to modify this in the future bc graph is not what i want :(
+
+ggplot(business_summary, aes(x = reorder(business_type, fail_rate), y = fail_rate)) +
+  geom_col(fill = "#b90d0d", alpha = 0.8, width = 0.6) +
+  geom_text(aes(label = paste0(round(fail_rate * 100, 1), "%")),
+            hjust = -0.15, size = 3.5) +
+  geom_text(aes(label = paste0("n=", scales::comma(n_inspections))),
+            y = 0.002, hjust = 0, size = 3, color = "white") +
+  scale_y_continuous(labels = scales::percent_format(),
+                     expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(
+    title = "Inspection Fail Rate by Business Type",
+    subtitle = "Justifies including business type as a control variable",
+    x = NULL,
+    y = "Inspection Fail Rate",
+    caption = "Source: Boston Food Inspection data"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank()
+  )
+
+ggsave("plot3_failrate_by_business.png", width = 9, height = 5, dpi = 300)
+
+#---------------------------------------------------------------------------
+# Correlation heatmap of ACS variables
+#---------------------------------------------------------------------------
+
+cor_vars = analysis_data %>%
+  filter(!acs_missing, !is.na(tract_geoid)) %>%
+  distinct(tract_geoid, .keep_all = TRUE) %>%
+  select(median_income, poverty_rate, pct_white, pct_black, pct_asian,
+         pct_hispanic, pct_foreign_born) %>%
+  drop_na()
+
+cor_matrix = cor(cor_vars, use = "complete.obs")
+
+colnames(cor_matrix) = c("Median Income", "Poverty Rate", "% White", "% Black",
+                          "% Asian", "% Hispanic", "% Foreign Born")
+rownames(cor_matrix) = colnames(cor_matrix)
+
+ggcorrplot(
+  cor_matrix,
+  type = "lower",
+  lab = TRUE,
+  lab_size = 3.5,
+  colors = c("#2a7b9b", "white", "#b90d0d"),
+  title = "Correlation Between Tract-Level Demographic Variables",
+  ggtheme = theme_minimal(base_size = 13)
+) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggsave("plot4_correlation_heatmap_tract.png", width = 8, height = 7, dpi = 300)
+
+# -----------------------------------------------------
+# Fail rate vs. Poverty rate (tract-lvl)
+# -----------------------------------------------------
+
+ggplot(tract_summary, aes(x = poverty_rate, y = fail_rate)) +
+  geom_point(aes(size = n_inspections), alpha = 0.5, color = "#b90d0d") +
+  geom_smooth(method = "lm", se = FALSE, color = "steelblue", linewidth = 0.8) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_size_continuous(range = c(1.5, 8), name = "Inspections") +
+  labs(
+    title = "Food Inspection Fail Rate vs. Poverty Rate",
+    subtitle = "Each point is a census tract (min. 10 inspections)",
+    x = "Poverty Rate (ACS 2019, tract level)",
+    y = "Inspection Fail Rate",
+    caption = "Source: Boston Food Inspection data & ACS 5-year estimates (tract level)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+ggsave("plot5_failrate_vs_poverty_tract.png", width = 9, height = 6, dpi = 300)
+
