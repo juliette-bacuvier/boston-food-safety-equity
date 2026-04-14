@@ -721,7 +721,7 @@ cat("\n=== Random effect variance across models ===\n")
 print(re_variances)
 
 # ==============================================================================
-# 16. COEFFICIENT PLOT
+# 16. COEFFICIENT PLOT (redesigned)
 # ==============================================================================
 
 coef_plot_data = data.frame(
@@ -731,33 +731,81 @@ coef_plot_data = data.frame(
   CI_upper = ci_adjusted[, 2]
 ) %>%
   filter(term != "(Intercept)") %>%
-  mutate(term = case_match(term,
-                           "income_scaled" ~ "Median Income (scaled)",
-                           "poverty_scaled" ~ "Poverty Rate (scaled)",
-                           "pct_white_scaled" ~ "% White (scaled)",
-                           "license_age_scaled" ~ "License Age (scaled)",
-                           "insp_freq_scaled" ~ "Inspection Frequency (scaled)",
-                           "time_scaled" ~ "Time (scaled)",
-                           "business_typeRetail Food" ~ "Business: Retail Food",
-                           "business_typeFood Truck/Mobile" ~ "Business: Food Truck/Mobile",
-                           "business_typeManufacturing/Wholesale" ~ "Business: Manufacturing/Wholesale",
-                           "business_typeOther" ~ "Business: Other",
-                           .default = term))
+  mutate(
+    term = case_match(term,
+                      "income_scaled" ~ "Median Income",
+                      "poverty_scaled" ~ "Poverty Rate",
+                      "pct_white_scaled" ~ "% White",
+                      "license_age_scaled" ~ "License Age",
+                      "insp_freq_scaled" ~ "Inspection Frequency",
+                      "time_scaled" ~ "Time",
+                      "business_typeRetail Food" ~ "Retail Food",
+                      "business_typeFood Truck/Mobile" ~ "Food Truck / Mobile",
+                      "business_typeManufacturing/Wholesale" ~ "Manufacturing / Wholesale",
+                      "business_typeOther" ~ "Other Business",
+                      .default = term),
+    # group variables for visual separation
+    category = case_when(
+      term %in% c("Median Income", "Poverty Rate", "% White") ~ "Neighbourhood SES",
+      term %in% c("License Age", "Inspection Frequency", "Time") ~ "Establishment & Time",
+      TRUE ~ "Business Type"),
+    category = factor(category, levels = c("Neighbourhood SES", "Establishment & Time", "Business Type")),
+    # colour-code by whether CI crosses 1
+    significant = CI_lower > 1 | CI_upper < 1,
+    direction = case_when(
+      !significant ~ "Not significant",
+      OR > 1 ~ "Higher odds of passing",
+      TRUE ~ "Lower odds of passing"))
 
 ggplot(coef_plot_data, aes(x = OR, y = reorder(term, OR))) +
-  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
-  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), height = 0.25, color = "grey40") +
-  geom_point(size = 3, color = red) +
-  scale_x_log10() +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey60", linewidth = 0.4) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper, color = direction),
+                 height = 0, linewidth = 0.9) +
+  geom_point(aes(color = direction, fill = direction),
+             size = 2.2, shape = 21, stroke = 0.8) +
+  geom_text(aes(label = sprintf("%.2f", OR)),
+            hjust = -0.5, vjust = 0.5, size = 3, color = "grey30", fontface = "bold") +
+  facet_grid(category ~ ., scales = "free_y", space = "free_y") +
+  scale_x_log10(breaks = c(0.5, 0.7, 1, 1.5, 2),
+                labels = c("0.5", "0.7", "1", "1.5", "2"),
+                expand = expansion(mult = c(0.08, 0.18))) +
+  scale_color_manual(values = c(
+    "Higher odds of passing" = "#2a7b9b",
+    "Lower odds of passing" = "#b90d0d",
+    "Not significant" = "grey60")) +
+  scale_fill_manual(values = c(
+    "Higher odds of passing" = "#2a7b9b",
+    "Lower odds of passing" = "#b90d0d",
+    "Not significant" = "grey80")) +
   labs(
-    title = "Odds Ratios from Mixed-Effects Logistic Regression",
-    subtitle = "Outcome: passing a food safety inspection | Random intercept by establishment\nOR > 1 = higher odds of passing; OR < 1 = lower odds of passing",
-    x = "Odds Ratio (log scale, 95% CI)",
+    title = "What Predicts Passing a Food Inspection?",
+    subtitle = "Odds ratios from mixed-effects logistic regression (95% CI)",
+    x = "Odds Ratio (log scale)",
     y = NULL,
     caption = "Source: Boston Food Inspection data & ACS 5-year estimates (2019)"
-  ) + theme_minimal(base_size = 13) + theme(plot.title = element_text(face = "bold"))
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "grey40", size = 10, margin = margin(b = 8)),
+    plot.caption = element_text(color = "grey50", size = 8, hjust = 0),
+    strip.text.y = element_text(angle = 0, face = "bold", size = 10,
+                                color = "grey30", hjust = 0),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    strip.placement = "outside",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "grey92", linewidth = 0.3),
+    panel.spacing.y = unit(0.4, "lines"),
+    axis.text.y = element_text(size = 8),
+    axis.title.x = element_text(size = 9, color = "grey40", margin = margin(t = 6)),
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 9),
+    legend.margin = margin(b = -4),
+    legend.key.size = unit(0.4, "cm"))
 
-ggsave("plot7_coefficient_plot.png", width = 9, height = 6, dpi = 300)
+ggsave("plot7_coefficient_plot.png", width = 8, height = 5.5, dpi = 300)
 
 # ==============================================================================
 # 17. PREDICTED PROBABILITY PLOT
