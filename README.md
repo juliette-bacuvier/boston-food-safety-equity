@@ -26,6 +26,8 @@ To reproduce the analysis, download the data manually:
 - **ACS 2019 5-year estimates:** pulled via the `tidycensus` R package inside the script. Requires a free Census API key: set it once with `tidycensus::census_api_key("YOUR_KEY", install = TRUE)`.
 - **Census tract shapefiles (Massachusetts, 2019):**  fetched via the `tigris` R package inside the script; cached locally on first run.
 
+**Note:** Data last downloaded April 3rd, 2026.
+
 ---
 
 ## Repository contents
@@ -107,7 +109,7 @@ See the poster for the full caveat discussion.
 
 ## Citation
 
-> Bacuvier, J. (2026). *Mapping Inequality on the Boston Plate: Neighbourhood Socioeconomics and Food Inspection Outcomes in Boston, 2015–2025.* Wellesley College, DS340H Data Science Capstone.
+> Bacuvier, J. (2026). *Neighbourhood Socioeconomics and Food Inspection Outcomes in Boston, 2015–2025.* Wellesley College, DS340H Data Science Capstone.
 
 ---
 
